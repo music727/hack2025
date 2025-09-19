@@ -1,0 +1,11 @@
+Invoice Number,Amount,Paid,Comments
+8O193,"4,589.10",Yes,Wrong invoice number
+ 109 ,45.88,Yes,Confirmed by phone
+inv62811!,"179,800.00",No,Confirmed by phone
+07791,109.10,Yes,Payment pending
+7093,"5,603.00",Yes,Urgent follow-up needed
+ 09310 ,782.09,No,Urgent follow-up needed
+10012!,"23,109.90",Yes,Paid in full
+inv92207,"179,800.00",Yes,Payment pending
+46981,"2,400.00",No,Paid in full
+ACM333,"7,000.00",Yes,Delayed due to holidays
