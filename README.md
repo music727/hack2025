@@ -65,5 +65,9 @@ Invoice/Payment reconciliation process is a critical financial control process w
 - Update records with agreed-upon adjustments
 
 
+**Presentation and Demo**:
+https://microsofteur-my.sharepoint.com/:p:/g/personal/mibeinar_microsoft_com/ERNL_SSlSMhFi2PsHoFM6f8B0j7ReuDACEfJqdWLt86ABw?e=NoQDBj
+https://microsofteur-my.sharepoint.com/:v:/g/personal/mibeinar_microsoft_com/EV8vMXN-BkJGnV3PA5K3khQBAUi3i-SjmPzOat21qHKADA?e=MhPqcc
+
 **Prototyping and ideation**:
 https://v0.app/chat/invoice-reconciliation-process-pcy1Dyo7b6J?f=1&b=b_rZq55nstKje
