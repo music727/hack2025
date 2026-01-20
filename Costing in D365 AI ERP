@@ -1,0 +1,1759 @@
+# D365 Finance & SCM Unified Multi-Ledger Costing Engine Design
+
+**Document Version:** 2.0  
+**Analysis Date:** January 20, 2026  
+**Prepared by:** Senior D365 Architect / GIA Expert / Cost Accounting Functional Consultant  
+**Scope:** Distribution / Trading Company Scenario (generalized design)
+
+---
+
+## Design Philosophy: Native Integration, Not Add-On
+
+> **Critical Design Decision:** The future-state costing engine is a **native capability within D365 Finance and Supply Chain Management**, not an external add-on. This represents a **merger of GIA concepts and Cost Accounting** into the core product, eliminating the current fragmentation and deployment complexity.
+
+---
+
+## Why Native Integration Matters
+
+| Add-On Approach (Current GIA) | Native Integration (Proposed) |
+|------------------------------|-------------------------------|
+| Requires LCS add-in installation | Part of standard D365 deployment |
+| Depends on Power Platform/Dataverse | Uses native D365 F&O infrastructure |
+| Shadow subledger only (no GL posting) | Full GL integration with multi-book posting |
+| Separate from Cost Accounting module | Unified with Cost Accounting capabilities |
+| Async processing via external service | Synchronous or near-real-time processing |
+| Additional licensing considerations | Included in Finance/SCM license |
+| Limited partner expertise | Standard D365 implementation skills |
+
+---
+
+## Document Sources & Availability
+
+### Local Files
+- ❌ `GIA supported functionalities.docx` - **Not available** in this workspace
+- ✅ `GIA_vs_CostingEngine_Analysis_v2.md` - Existing analysis used as reference
+
+### Microsoft Learn Documentation Accessed
+- ✅ Global Inventory Accounting home page, Get started, Business documents, Conventions, GIA Ledger
+- ✅ Cost Accounting home page, Terminology, Cost Elements, Cost Objects, Allocation Bases
+- ✅ Overhead Calculation, Cost Rollup Policy, Cost Control Workspace, Dimension Hierarchy
+- ✅ Access Rights for Cost Object Controllers
+
+---
+
+# 1. Global Inventory Accounting – Key Concepts & Capabilities
+
+## 1.1 Purpose & Scope
+
+### What Problem GIA Solves
+
+**Global Inventory Accounting (GIA)** is an add-in for Microsoft Dynamics 365 Supply Chain Management that addresses a fundamental challenge for international organizations: **the need to report inventory value differently to different stakeholders** while maintaining a single operational truth.
+
+| Business Driver | GIA Solution |
+|-----------------|--------------|
+| **Multi-standard compliance** | Same inventory transaction valued under IFRS, US GAAP, local GAAP, and management standards simultaneously |
+| **Multi-currency consolidation** | Subsidiaries operate in local currency; group reporting in EUR/USD; GIA maintains parallel currency valuations |
+| **Dual valuation requirements** | Statutory books may require weighted average; tax authority may accept standard cost; management wants full absorption—all from one transaction |
+| **Audit trail across representations** | Single source transaction with traceable calculation to N different inventory values |
+
+### How GIA Relates to Standard SCM Inventory Costing
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│            OPERATIONAL INVENTORY TRANSACTION                 │
+│         (PO Receipt, SO Invoice, Transfer, etc.)            │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+           ┌───────────────┴───────────────┐
+           ▼                               ▼
+┌─────────────────────────┐    ┌─────────────────────────────┐
+│  STANDARD SCM COSTING   │    │   GLOBAL INVENTORY          │
+│                         │    │   ACCOUNTING (GIA)          │
+│  • Posts to GL          │    │   • Shadow subledger only   │
+│  • Single valuation     │    │   • N parallel valuations   │
+│  • Single currency      │    │   • N currencies            │
+│  • Book of record       │    │   • Reporting/analysis      │
+└─────────────────────────┘    └─────────────────────────────┘
+```
+
+**Key architectural point:** GIA operates as a **shadow subledger**—it generates accounting entries but does NOT post to the General Ledger. Standard D365 inventory costing remains the book of record for GL purposes.
+
+---
+
+## 1.2 Core Concepts & Data Model
+
+### GIA Ledger Definition
+
+A **Global Inventory Accounting Ledger** is a complete inventory accounting perspective. Each GIA Ledger is defined by:
+
+| Attribute | Description | Configuration Impact |
+|-----------|-------------|---------------------|
+| **Name** | Unique identifier for the ledger | User-facing label |
+| **Fiscal Calendar** | Period structure for the ledger | May differ from operational calendar (e.g., 4-4-5 vs. calendar month) |
+| **Currency** | Accounting currency for this view | EUR, USD, JPY, etc.—enables dual-currency reporting |
+| **Exchange Rate Type** | Which FX rate table to use | Spot, Budget, Average, Historical—affects currency translation |
+| **Convention** | Linked policy bundle defining valuation rules | The "how" of inventory accounting |
+| **Legal Entity** | Which legal entity this ledger belongs to | One LE can have multiple GIA ledgers |
+| **Priming** | How to handle transactions before GIA go-live | Activated = process historical; Deactivated = start fresh |
+| **Status** | System-managed state | Prepare → Active |
+
+**Key design principle:** GIA separates the *ledger container* from the *policies* (Convention), enabling **policy reuse** across ledgers and legal entities.
+
+### Conventions (Inventory Accounting Policies)
+
+A **Convention** bundles four policy types that together define how inventory is valued:
+
+| Policy Type | What It Controls | Available Options |
+|-------------|-----------------|-------------------|
+| **Cost Object Policy** | At what granularity level is inventory value tracked? | `Product–Site`, `Product–Site–Warehouse` |
+| **Input Measurement Basis Policy** | What cost flows into inventory on receipt? | `Normal Historical` (actual), `Standard` (predetermined) |
+| **Cost Flow Assumption Policy** | How are costs assigned to outflows (COGS)? | `Average` (weighted), `Specific – Batch` (lot-level tracking) |
+| **Cost Element Policy** | How is total cost categorized/decomposed? | User-defined cost element lists with mapping rules |
+
+#### Cost Object Policy Deep Dive
+
+| Option | Inventory Tracked At | Use Case |
+|--------|---------------------|----------|
+| **Product–Site** | Product + Site combination | Transfers between warehouses don't affect inventory value |
+| **Product–Site–Warehouse** | Product + Site + Warehouse | Full visibility of inventory value at warehouse level |
+
+#### Input Measurement Basis Policy Deep Dive
+
+| Option | How Input Cost Determined | Variance Handling |
+|--------|--------------------------|-------------------|
+| **Normal Historical** | Actual cost from transaction (PO price, charges) | No variance—all actual |
+| **Standard** | Predetermined standard cost from price list | Purchase price variance captured |
+
+**Price Lists for Standard Cost:** GIA allows fetching item prices from multiple legal entities via configurable price lists, enabling shared standard costs across subsidiaries.
+
+#### Cost Flow Assumption Policy Deep Dive
+
+| Option | COGS Calculation | Inventory Tracking |
+|--------|------------------|-------------------|
+| **Average** | Weighted average cost (perpetual) | Running average per cost object |
+| **Specific – Batch** | Actual cost of specific batch consumed | Batch-level cost tracking |
+
+**Not currently supported:** FIFO, LIFO, Weighted Average Date—a known limitation.
+
+#### Cost Element Policy Deep Dive
+
+Cost elements are the building blocks for breaking down inventory value into components:
+
+```
+Total Inventory Value = Σ (Cost Element Values)
+                      = Material Cost + Freight + Customs + Handling + ...
+```
+
+Each cost element policy contains:
+- **Cost Element List**: Named categories (e.g., "Material", "Freight Inbound", "Customs Duty")
+- **Mapping Rules**: Rules that map operational measurements (price, charges, discounts) to cost elements
+
+**Important:** Even if you don't want to break down inventory value, you must create at least one cost element and map all measurement types to it.
+
+### Relationship Model
+
+```
+┌─────────────────┐
+│  Legal Entity   │
+└────────┬────────┘
+         │ 1:N
+         ▼
+┌─────────────────┐     ┌─────────────────┐
+│   GIA Ledger    │────▶│   Convention    │
+│                 │ N:1 │                 │
+│ - Calendar      │     │ - Cost Object   │
+│ - Currency      │     │   Policy        │
+│ - FX Rate Type  │     │ - Input Basis   │
+│ - Priming       │     │   Policy        │
+└─────────────────┘     │ - Cost Flow     │
+                        │   Policy        │
+                        │ - Cost Element  │
+                        │   Policy        │
+                        └─────────────────┘
+```
+
+**Key insight:** Multiple GIA Ledgers can share the same Convention—enabling consistent policies across different currency/calendar views.
+
+---
+
+## 1.3 Business Document Coverage & Processing Model
+
+### Supported Business Documents
+
+| Document Category | Specific Documents | Events Generated |
+|-------------------|-------------------|------------------|
+| **Purchase Order** | Product Receipt | Inventory inflow + cost capture |
+| **Purchase Order** | Invoice | Cost adjustment (actual vs. accrued) |
+| **Sales Order** | Packing Slip | Inventory outflow + revenue recognition prep |
+| **Sales Order** | Invoice | COGS recognition |
+| **Inventory Journals** | Movement | Internal transfer between dimensions |
+| **Inventory Journals** | Adjustment | Quantity/value corrections |
+| **Inventory Journals** | Counting | Physical count variances |
+| **Inventory Journals** | Transfer | Movement between locations |
+| **Transfer Order** | Shipment | Inventory in transit |
+| **Transfer Order** | Receive | Arrival at destination |
+
+### Event-Based Processing Architecture
+
+GIA uses an **event-sourced architecture**:
+
+```
+Operational Transaction → Operational Event → GIA Event → GIA Measurements
+                           (single source)    (N per ledger)  (cost entries)
+```
+
+#### Measurement Types
+
+For each event, GIA generates two types of measurements:
+
+| Measurement Type | Description | Examples |
+|------------------|-------------|----------|
+| **Operations Measurements** | Business document details in generic terms | Product quantity (in document UoM), extended price, discount, line charges |
+| **Resource Accounting Measurements** | Inventory register impact in inventory UoM | Inventory quantity change, cost amount change |
+
+#### Dimension Structure
+
+Measurements are organized by dimensions:
+
+| Dimension Category | Purpose | Examples |
+|-------------------|---------|----------|
+| **Duality** | Who participates in the economic event | Legal entity (primal), Vendor/Customer (dual) |
+| **Dimension Type** | Categorization of dimensions | Cost object, Cost element, Subledger account |
+| **Dimension Value** | Specific value within dimension | Product ID, Site ID, Account number |
+
+### Asynchronous Processing
+
+**Critical:** GIA processes documents **asynchronously** after they're posted in SCM. This means:
+- No blocking of operational transactions
+- Eventual consistency between SCM and GIA views
+- No real-time error messages for GIA processing issues
+
+---
+
+## 1.4 Multi-Ledger & Multi-Standard Accounting
+
+### Multiple GIA Ledgers per Legal Entity
+
+A single legal entity can have multiple GIA ledgers to support different reporting requirements:
+
+| Ledger | Purpose | Configuration |
+|--------|---------|---------------|
+| **GAAP_USD** | US statutory reporting | Calendar: Fiscal, Currency: USD, Method: Avg |
+| **IFRS_EUR** | International consolidation | Calendar: Fiscal, Currency: EUR, Method: Avg |
+| **TAX_USD** | Tax compliance | Calendar: Tax, Currency: USD, Method: Standard |
+| **MGMT_USD** | Management reporting | Calendar: Fiscal, Currency: USD, Method: Standard |
+
+### Dual-Currency / Dual-Valuation Reporting
+
+| Scenario | How GIA Addresses |
+|----------|-------------------|
+| **Dual currency** | Create two ledgers with different currencies; same Convention |
+| **Dual valuation** | Create two ledgers with different Conventions (e.g., one Avg, one Standard) |
+| **Currency + Valuation** | Create N ledgers with appropriate currency/Convention combinations |
+
+### Processing Flow
+
+```
+Single Operational Event
+          │
+          ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    GIA EVENT PROCESSOR                           │
+│                                                                  │
+│  For each active GIA Ledger associated with this Legal Entity:  │
+│    1. Apply Convention policies                                  │
+│    2. Determine cost elements and values                         │
+│    3. Convert to ledger currency using specified FX rate        │
+│    4. Generate GIA measurements and subledger entries           │
+└─────────────────────────────────────────────────────────────────┘
+          │
+    ┌─────┴─────┬─────────────┬─────────────┐
+    ▼           ▼             ▼             ▼
+┌────────┐ ┌────────┐    ┌────────┐    ┌────────┐
+│GAAP USD│ │IFRS EUR│    │TAX USD │    │MGMT USD│
+└────────┘ └────────┘    └────────┘    └────────┘
+```
+
+---
+
+## 1.5 Configuration Model
+
+### Configuration Entities and Ownership
+
+| Configuration Area | Configured By | Frequency | Complexity |
+|-------------------|--------------|-----------|------------|
+| **GIA Ledgers** | Finance / Accounting leadership | Once per reporting requirement | Low |
+| **Conventions** | Costing specialist / Consultant | Once, then rarely changed | Medium |
+| **Cost Element Lists** | Costing specialist | Occasional updates | Medium |
+| **Cost Element Mapping Rules** | Costing specialist | When new scenarios arise | Medium-High |
+| **Price Lists (for Standard)** | Cost accountant | Periodic (annual/quarterly) | Low |
+
+### Configuration Complexity Analysis
+
+| Aspect | Complexity Rating | Notes |
+|--------|-------------------|-------|
+| **Initial setup** | ⚠️ Medium-High | Requires understanding of accounting standards and business requirements |
+| **Ongoing maintenance** | ✅ Low | Once configured, minimal changes needed |
+| **Policy reuse** | ✅ Excellent | Conventions can be shared across ledgers |
+| **Multi-LE rollout** | ⚠️ Medium | Each LE needs ledger setup; Conventions can be shared |
+
+### Where Complexity Manifests
+
+| Pain Point | Description | Impact |
+|------------|-------------|--------|
+| **Convention policy understanding** | Four policy types with interdependencies | Requires specialist knowledge |
+| **Cost element mapping** | Mapping operational measures to cost elements | Error-prone if not carefully designed |
+| **Relationship between SCM costing and GIA** | Confusion about which system "owns" what | Customer confusion during implementation |
+| **No GL posting** | Shadow-only limitation means dual maintenance | Reconciliation burden |
+
+---
+
+## 1.6 Analytics Integration
+
+### Power BI Integration
+
+GIA integrates with Power BI through:
+
+| Component | Description |
+|-----------|-------------|
+| **Entity Store** | GIA measurements published to Entity Store for reporting |
+| **Dataverse** | Integration with Microsoft Power Platform via Dataverse |
+| **Template Reports** | Pre-built Power BI templates for inventory valuation analysis |
+
+### Available Analytics Views
+
+| Report Type | Content | Use Case |
+|-------------|---------|----------|
+| **Inventory Balance by Ledger** | Inventory value per GIA ledger over time | Multi-standard reporting |
+| **Cost Element Breakdown** | Inventory value by cost element category | Cost composition analysis |
+| **Variance Analysis** | Standard vs. actual (where applicable) | Variance investigation |
+| **Cross-Ledger Comparison** | Side-by-side views of different valuations | GAAP vs. IFRS reconciliation |
+
+---
+
+## 1.7 Current Limitations (What GIA Does NOT Do)
+
+| Gap | Description | Business Impact |
+|-----|-------------|-----------------|
+| **No FIFO/LIFO** | Only Average, Specific Identification, Standard supported | Cannot support US LIFO for tax or IFRS preference for FIFO |
+| **No GL Posting** | All GIA ledgers are shadow subledgers | One GL book must use standard D365 costing |
+| **No Overhead Allocation** | Cannot allocate indirect costs (warehouse, admin) to inventory | No full absorption costing |
+| **No Landed Cost Integration** | Freight, duties handled separately in Landed Cost module | Not unified cost view |
+| **No Period-End Recalculation** | No inventory close process for GIA ledgers | Limited period-end adjustments |
+| **No Manufacturing** | BOM costing, production variances not supported | Distribution-only focus |
+| **Limited Batch Tracking** | Specific identification only at batch level | No FIFO within batches |
+
+### The Fundamental Problem with GIA as an Add-On
+
+| Add-On Limitation | Impact on Adoption |
+|-------------------|--------------------|
+| **Requires LCS installation** | Additional deployment complexity; IT involvement |
+| **Power Platform dependency** | Adds infrastructure; may conflict with existing Dataverse usage |
+| **External service processing** | Latency; separate monitoring; potential sync issues |
+| **Shadow-only architecture** | Cannot be the "book of record"; always secondary to standard costing |
+| **Separate from Cost Accounting** | Two modules that should be one; customers confused about which to use |
+| **Specialist expertise required** | Few partners know GIA; implementation resources scarce |
+
+**Conclusion:** GIA's concepts are sound, but its add-on architecture limits adoption. The solution is to **bring these capabilities natively into D365 Finance and SCM** and merge them with Cost Accounting.
+
+---
+
+# 2. Cost Accounting in D365 Finance – Key Concepts & Complexity
+
+## 2.1 Conceptual Model
+
+### Purpose of Cost Accounting Module
+
+The **Cost Accounting module** in D365 Finance is designed for **managerial cost analysis**—providing insights into cost behavior, allocation, and control that go beyond statutory financial accounting. It operates as a separate analytical layer that:
+
+- Imports data from GL, budgets, and statistical sources
+- Applies managerial accounting policies (different from statutory)
+- Enables cost allocation, overhead calculation, and profitability analysis
+- Provides role-based access to cost information
+
+### Cost Accounting Ledger
+
+The **Cost Accounting Ledger** is the foundation of the module—a container that defines the scope and rules for cost analysis:
+
+| Attribute | Description |
+|-----------|-------------|
+| **Fiscal Calendar** | Period structure for cost analysis |
+| **Currency** | Currency for cost accounting (may differ from GL) |
+| **Cost Element Dimension** | Which dimension represents "what was spent" |
+| **Statistical Dimension** | Which dimension represents non-monetary measures |
+
+**Key distinction from GL:** The Cost Accounting Ledger doesn't replace GL; it provides an **analytical overlay** for management reporting.
+
+### Cost Element Dimensions
+
+Cost elements answer the question: **"What type of cost was incurred?"**
+
+| Cost Element Type | Description | Examples |
+|-------------------|-------------|----------|
+| **Primary** | Costs that flow from financial accounting (GL) | Salaries, Rent, Utilities, Materials |
+| **Secondary** | Costs created through allocation within Cost Accounting | "Allocated IT Costs", "Overhead Applied" |
+
+**Primary cost elements** typically correspond to GL main accounts (P&L accounts). The structure often mirrors the chart of accounts.
+
+**Secondary cost elements** are used to:
+- Track cost flow between cost objects (reciprocal allocations)
+- Roll up costs into meaningful categories
+- Enable traceability of allocated costs
+
+### Cost Object Dimensions
+
+Cost objects answer the question: **"Who or what consumed the cost?"**
+
+| Cost Object Type | Description | Examples |
+|------------------|-------------|----------|
+| **Cost Center** | Organizational unit responsible for costs | HR Department, IT Department, Warehouse |
+| **Product** | Item or service that consumes costs | SKU, Product Group |
+| **Project** | Initiative that accumulates costs | Construction Project, R&D Initiative |
+| **Customer** | External party for profitability analysis | Customer Account |
+| **Department** | Broader organizational grouping | Operations, Sales, Finance |
+
+**Key insight:** Cost objects are imported from financial dimensions or other source systems—they're not created fresh in Cost Accounting.
+
+### Statistical Dimensions and Measures
+
+**Statistical dimensions** represent non-monetary quantities used as allocation bases:
+
+| Statistical Measure | Description | Use Case |
+|--------------------|-------------|----------|
+| **Headcount (FTE)** | Full-time equivalent employees | Allocate HR costs by headcount |
+| **Square Meters** | Floor space occupied | Allocate rent by space |
+| **Kilowatt Hours** | Electricity consumption | Allocate utilities by usage |
+| **Machine Hours** | Equipment utilization | Allocate maintenance costs |
+| **Transactions** | Count of activities | Allocate IT costs by transaction volume |
+
+Statistical measures can be:
+- Imported from source systems (HR, Facilities, Production)
+- Entered manually via data import
+- Calculated from existing data
+
+### Dimension Hierarchies
+
+Dimension hierarchies define the **structure for reporting and policy application**:
+
+| Hierarchy Type | Purpose | Characteristics |
+|----------------|---------|-----------------|
+| **Dimension Categorization Hierarchy** | Reporting only | Supports cost element dimensions; members can appear multiple times |
+| **Dimension Classification Hierarchy** | Policies + Reporting | Supports all dimensions; each member appears once |
+
+**Hierarchy uses:**
+1. **Reporting structure**: Roll-up for management reporting (e.g., All Costs → Admin → HR → Specific Cost Center)
+2. **Policy application**: Apply rules at hierarchy level (e.g., "All Admin cost centers use this allocation base")
+3. **Security setup**: Grant access based on hierarchy position
+
+---
+
+## 2.2 Policies & Rules
+
+### Policy Types Overview
+
+| Policy Type | What It Controls | When Applied |
+|-------------|-----------------|--------------|
+| **Cost Behavior Policy** | Classify costs as Fixed, Variable, or Semi-variable | After data import, before allocation |
+| **Cost Distribution Policy** | Redistribute costs at primary cost element level | During overhead calculation |
+| **Cost Allocation Policy** | Allocate costs using allocation bases | During overhead calculation |
+| **Cost Rollup Policy** | Aggregate costs into secondary cost elements | During overhead calculation |
+
+### Cost Behavior Policies
+
+**Purpose:** Classify costs by their behavior in relation to activity changes.
+
+| Classification | Description | Example |
+|----------------|-------------|---------|
+| **Fixed** | Does not vary with activity level in short term | Rent, Salaries, Insurance |
+| **Variable** | Varies proportionally with activity | Materials, Commissions, Utilities (usage) |
+| **Semi-variable** | Contains both fixed and variable components | Electricity (base fee + usage) |
+
+**Configuration:**
+- Define cost ranges and classify behavior
+- E.g., Electricity: $0–$1000 = Fixed; $1000.01+ = Variable
+
+### Cost Distribution Policies
+
+**Purpose:** Spread costs from one cost object to others using an allocation base, **keeping the primary cost element intact**.
+
+| Component | Description |
+|-----------|-------------|
+| **Source** | Which cost object's costs to distribute |
+| **Allocation Base** | Basis for distribution (cost element, statistical measure) |
+| **Targets** | Which cost objects receive the distributed costs |
+
+**Key characteristic:** Cost distribution maintains the original primary cost element—you can still see "Electricity" even after it's distributed.
+
+### Cost Allocation Policies
+
+**Purpose:** Allocate costs using secondary cost elements to show cost flow.
+
+| Component | Description |
+|-----------|-------------|
+| **Source** | Cost object providing costs |
+| **Secondary Cost Element** | New cost element created for allocation |
+| **Allocation Base** | Basis for allocation |
+| **Targets** | Cost objects receiving allocated costs |
+
+**Reciprocal allocation:** Finance supports reciprocal allocation where service departments allocate to each other (e.g., HR allocates to IT; IT allocates to HR). The system iterates to find equilibrium.
+
+### Cost Rollup Policies
+
+**Purpose:** Aggregate costs into meaningful buckets using secondary cost elements, enabling traceability of cost flow.
+
+| Without Rollup | With Rollup |
+|----------------|-------------|
+| After allocation, auxiliary cost centers show zero balance | Each cost center shows rolled-up cost by secondary element |
+| Primary costs flow directly to final cost objects | Cost flow is traceable through secondary elements |
+
+### Allocation Bases
+
+Allocation bases determine **how** costs are spread across cost objects:
+
+| Allocation Base Type | Description | Example |
+|---------------------|-------------|---------|
+| **Predefined Dimension Member** | Based on cost element or statistical dimension values | Allocate by Salary amounts, by FTE count |
+| **Hierarchy Allocation Base** | Filter predefined base by hierarchy node | Allocate HR costs only to departments under CFO |
+| **Formula Allocation Base** | Custom formula combining bases | (Electricity kWh > 10000) × 1.15 rate |
+
+**Formula capabilities:**
+- Arithmetic operations (+, -, ×)
+- Comparisons (<, >)
+- Conditional logic via comparison expressions
+
+---
+
+## 2.3 Data Sourcing & Integration
+
+### Data Connectors
+
+| Connector | Source | Data Type |
+|-----------|--------|-----------|
+| **Dynamics 365 Finance** | General Ledger | GL transactions, budget entries |
+| **Dynamics AX** | Legacy systems | Historical data migration |
+| **Imported Transactions** | External files | Any cost or statistical data |
+
+### Data Provider Configuration
+
+| Data Type | Available Sources |
+|-----------|-------------------|
+| **Cost Element Dimension Members** | Finance GL, AX, Import |
+| **Cost Object Dimension Members** | Finance GL, AX, Import |
+| **Statistical Dimension Members** | Import only |
+| **General Ledger Entries** | Finance GL, AX, Import |
+| **Budget Entries** | Finance GL, AX, Import |
+| **Statistical Measures** | Import, Calculated |
+
+### Data Processing Flow
+
+```
+Source Systems (GL, Budget, Statistical)
+          │
+          ▼
+┌─────────────────────────────────────────┐
+│         DATA CONNECTORS                  │
+│                                          │
+│  Import dimension members                │
+│  Import transactions                     │
+│  Import statistical measures             │
+└────────────────┬────────────────────────┘
+                 │
+                 ▼
+┌─────────────────────────────────────────┐
+│         COST ACCOUNTING LEDGER          │
+│                                          │
+│  Cost entries (unclassified)            │
+│  Statistical entries                     │
+└────────────────┬────────────────────────┘
+                 │
+                 ▼
+┌─────────────────────────────────────────┐
+│         OVERHEAD CALCULATION             │
+│                                          │
+│  1. Cost behavior classification         │
+│  2. Cost distribution                    │
+│  3. Overhead rate calculation            │
+│  4. Cost allocation                      │
+└─────────────────────────────────────────┘
+```
+
+### Versioning and Traceability
+
+Each overhead calculation run creates a **version** with:
+- Unique version ID
+- Date and time
+- Fiscal period
+- All cost entries generated
+
+This enables:
+- Comparison between calculation runs
+- What-if analysis with different parameters
+- Audit trail for cost allocations
+
+---
+
+## 2.4 Security & UX
+
+### Cost Control Units
+
+A **Cost Control Unit** defines the cost structure for security and reporting:
+- Which cost object dimension hierarchy to use
+- Controls how costs flow hierarchically
+- Foundation for access rights configuration
+
+### Access Rights for Cost Object Controllers
+
+| Role | Capabilities |
+|------|--------------|
+| **Cost Accounting Manager** | Full access to all configuration and data |
+| **Cost Accountant** | Configure and run overhead calculations |
+| **Cost Accountant Clerk** | View and process cost data |
+| **Cost Object Controller** | View cost data for assigned cost objects only |
+
+**Row-level security:** Access list hierarchies control which cost objects each user can see, enforced across:
+- Cost Control Workspace (client)
+- Cost Control Workspace (mobile)
+- Power BI visualizations
+
+### Cost Control Workspace
+
+The **Cost Control Workspace** is the primary user interface for managers:
+
+| Feature | Description |
+|---------|-------------|
+| **Report configurations** | Multiple report layouts per cost accounting ledger |
+| **Period selection** | View current period, previous period, YTD |
+| **Budget comparison** | Actual vs. original budget vs. revised budget |
+| **Variance thresholds** | Highlight when variances exceed thresholds |
+| **Drill-through** | Navigate from summary to cost entry details |
+
+**Workspace configuration options:**
+- Columns to display (Fixed, Variable, Total, Unclassified)
+- Fiscal periods to include
+- Budget versions for comparison
+- Variance threshold highlighting
+
+### Power BI Integration
+
+| Component | Description |
+|-----------|-------------|
+| **Entity Store** | Cost accounting data published for BI |
+| **Content Pack** | Pre-built Power BI reports |
+| **Row-Level Security** | Access list hierarchy paired with Power BI RLS |
+
+---
+
+## 2.5 Configuration Surface & Complexity
+
+### Main Configuration Entities
+
+| Entity | Count (Typical) | Complexity | Purpose |
+|--------|-----------------|------------|---------|
+| **Cost Accounting Ledger** | 1-3 per LE | Medium | Container for cost analysis |
+| **Cost Element Dimensions** | 1 per ledger | Medium | Primary + Secondary elements |
+| **Cost Element Dimension Members** | 50-200 | Low-Medium | Import from GL main accounts |
+| **Cost Object Dimensions** | 1-3 per ledger | Medium | Cost centers, Products, etc. |
+| **Cost Object Dimension Members** | 100-1000+ | Low | Import from financial dimensions |
+| **Statistical Dimensions** | 1-5 | Medium | Non-monetary allocation bases |
+| **Statistical Dimension Members** | 10-50 | Low | FTE, Square meters, kWh, etc. |
+| **Dimension Hierarchies** | 5-15 | High | Reporting + Policy structures |
+| **Cost Control Units** | 1-3 | Medium | Security boundaries |
+| **Cost Behavior Policies** | 1-5 | Medium-High | Fixed/Variable classification |
+| **Cost Distribution Policies** | 2-10 | High | Primary element redistribution |
+| **Cost Allocation Policies** | 2-10 | High | Secondary element allocation |
+| **Cost Rollup Policies** | 1-5 | High | Cost aggregation rules |
+| **Allocation Bases** | 10-50 | High | Allocation formulas |
+| **Workspace Configurations** | 3-10 | Medium | Report layouts |
+| **Access List Hierarchies** | 1-3 | High | Security configuration |
+
+**Total configuration entities:** 15+ distinct configuration types with complex interdependencies.
+
+### Why Cost Accounting Feels Complex
+
+| Complexity Factor | Description | Impact |
+|-------------------|-------------|--------|
+| **Separate from GL** | Parallel data structure to General Ledger | Dual maintenance, reconciliation burden |
+| **Many policy types** | Four policy types (Behavior, Distribution, Allocation, Rollup) with subtle differences | Confusion about which to use when |
+| **Dimension redundancy** | Cost elements ≈ Main accounts; Cost objects ≈ Financial dimensions | "Why am I defining this twice?" |
+| **Hierarchy complexity** | Two hierarchy types (Categorization, Classification) with different rules | Non-intuitive structure |
+| **Formula learning curve** | Formula allocation bases require technical understanding | Not accessible to typical cost accountants |
+| **Security setup** | Access list hierarchies separate from standard D365 security | Additional configuration layer |
+| **Data connector setup** | Mapping source data to Cost Accounting structures | Technical implementation burden |
+| **Multi-step overhead calculation** | Four sequential steps with specific ordering | Process complexity |
+| **Versioning overhead** | Each calculation creates versions; managing versions is additional work | Operational overhead |
+
+### Customer Adoption Barriers
+
+| Barrier | Manifestation |
+|---------|---------------|
+| **Expertise requirement** | Only specialized consultants can implement |
+| **Time to value** | Weeks/months to configure before seeing benefit |
+| **GL redundancy perception** | "Why not just use Financial Dimensions and Management Reporter?" |
+| **Maintenance burden** | Ongoing effort to keep hierarchies, policies, data in sync |
+| **Limited out-of-box content** | Few templates or pre-built configurations |
+| **Integration gaps** | Not well integrated with SCM costing, GIA, or Project Accounting |
+
+---
+
+# 3. Comparison & Pain Point Analysis (GIA vs Cost Accounting vs Classic Costing)
+
+## 3.1 Comparison Table
+
+| Dimension | Classic SCM/Finance Costing | Global Inventory Accounting (GIA) | Cost Accounting Module |
+|-----------|----------------------------|-----------------------------------|------------------------|
+| **Primary Scope** | Inventory valuation for GL posting | Multi-ledger inventory valuation (shadow) | Managerial cost analysis, overhead allocation |
+| **Data Model** | Inventory transactions → GL | GIA Ledgers with Conventions | Cost Accounting Ledger with dimensions |
+| **Cost Elements/Accounts** | GL Main Accounts via posting profiles | Cost Element Policy with mapping rules | Cost Element Dimension (Primary + Secondary) |
+| **Cost Objects** | Item + Dimensions (Site, Warehouse, Batch) | Cost Object Policy (Product-Site or Product-Site-Warehouse) | Cost Object Dimension (imported from Financial Dimensions) |
+| **Multi-Ledger Capability** | Single valuation per LE | ✅ Multiple GIA Ledgers per LE | Single Cost Accounting Ledger per scope (can have multiple) |
+| **Multi-Standard Support** | Limited (one valuation method) | ✅ Different Conventions per ledger (Avg, Standard) | Not designed for GAAP/IFRS differences |
+| **GL Posting** | ✅ Primary GL posting | ❌ Shadow only (no GL posting) | ❌ Off-GL analytical layer |
+| **Overhead/Allocation** | Limited (costing sheet for manufacturing) | ❌ Not supported | ✅ Full allocation engine (behavior, distribution, allocation, rollup) |
+| **Valuation Methods** | FIFO, LIFO, Avg, Standard, Specific ID | Avg, Standard, Specific ID (no FIFO/LIFO) | N/A (doesn't value inventory) |
+| **Analytics** | Standard financial reports | Power BI via Entity Store/Dataverse | Cost Control Workspace, Power BI |
+| **Security Model** | Standard D365 security | Standard D365 security | Custom access list hierarchy with RLS |
+| **Configuration Complexity** | Low-Medium | Medium | High |
+| **Typical Implementer** | Finance consultant | SCM/Finance specialist | Cost Accounting specialist (rare) |
+| **Target User** | Finance team | Finance/Controller | Cost accountants, Controllers, Managers |
+
+## 3.2 Overlaps and Duplicated Concepts
+
+| Concept | Classic Costing | GIA | Cost Accounting | Duplication Level |
+|---------|-----------------|-----|-----------------|-------------------|
+| **Cost accounts/elements** | Main Accounts | Cost Element Policy | Cost Element Dimension | **HIGH** - Three parallel definitions |
+| **Cost object granularity** | Item Model Group + Dimensions | Cost Object Policy | Cost Object Dimension | **HIGH** - Three approaches |
+| **Ledger/book structure** | One GL per LE | Multiple GIA Ledgers per LE | Cost Accounting Ledger | **MEDIUM** - Different purposes |
+| **Hierarchies** | Financial Dimension Hierarchies | N/A | Dimension Hierarchies | **MEDIUM** - Separate maintenance |
+| **Allocation rules** | Costing Sheet (manufacturing) | N/A | Allocation Policies + Bases | **LOW** - Different scope |
+| **Currency handling** | Ledger currency + reporting currency | Per-ledger currency | Per-ledger currency | **LOW** - Aligned |
+
+## 3.3 Where GIA is Strong (Valuation Backbone)
+
+| Strength | Description |
+|----------|-------------|
+| **True multi-ledger design** | Purpose-built for N parallel inventory valuations |
+| **Convention reuse** | Policy bundles shared across ledgers for consistency |
+| **Event-sourced architecture** | Single operational event → N accounting outcomes (auditable) |
+| **Currency flexibility** | Different currency per ledger with exchange rate control |
+| **Cost element decomposition** | Break inventory value into components (material, freight, etc.) |
+| **Perpetual valuation** | Transaction-by-transaction tracking (weighted average) |
+
+## 3.4 Where Cost Accounting is Strong (Managerial Layer)
+
+| Strength | Description |
+|----------|-------------|
+| **Overhead allocation engine** | Full cost distribution, allocation, rollup capabilities |
+| **Statistical measures** | Non-monetary bases for allocation (FTE, square meters, kWh) |
+| **Cost behavior classification** | Fixed/Variable/Semi-variable analysis |
+| **Reciprocal allocation** | Mutual service department allocations |
+| **Managerial reporting** | Cost Control Workspace with budget comparison |
+| **Role-based access** | Granular security for cost object controllers |
+
+## 3.5 Why Adoption is Low for Both
+
+### GIA Adoption Barriers
+
+| Barrier | Root Cause | Evidence |
+|---------|------------|----------|
+| **Shadow-only limitation** | One GL must use classic costing; GIA is "extra work" | Customers question value if GL is still primary |
+| **Missing valuation methods** | No FIFO/LIFO limits applicability | US companies with LIFO requirements can't fully use GIA |
+| **Specialist knowledge required** | Convention policies need deep understanding | Few partners have GIA expertise |
+| **No overhead allocation** | Cannot achieve full product cost | Requires Cost Accounting or manual processes |
+| **Add-in deployment** | Requires LCS installation and Power Platform integration | Additional IT complexity |
+
+### Cost Accounting Adoption Barriers
+
+| Barrier | Root Cause | Evidence |
+|---------|------------|----------|
+| **Perceived redundancy with GL** | "We already have financial dimensions and Management Reporter" | Customers don't see incremental value |
+| **Configuration burden** | 15+ entity types to configure before value | Long time-to-value discourages adoption |
+| **Expertise scarcity** | Very few consultants know Cost Accounting well | Projects struggle to find resources |
+| **Off-GL perception** | "If it doesn't post to GL, is it real?" | Finance teams skeptical of shadow analysis |
+| **Manufacturing orientation** | Documentation and examples focus on manufacturing | Distribution companies don't see fit |
+| **Hierarchy maintenance** | Hierarchies must be kept in sync with organization changes | Ongoing burden discourages adoption |
+
+### The Fundamental Disconnect
+
+```
+CUSTOMER EXPECTATION:
+"I want multi-ledger inventory valuation with overhead allocation,
+ posting to GL, simple configuration, and easy adoption."
+
+CURRENT REALITY:
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│ Classic Costing │    │      GIA        │    │ Cost Accounting │
+│                 │    │                 │    │                 │
+│ ✅ Posts to GL  │    │ ✅ Multi-ledger │    │ ✅ Overhead     │
+│ ❌ Multi-ledger │    │ ❌ No GL post   │    │ ❌ No valuation │
+│ ❌ Overhead     │    │ ❌ No overhead  │    │ ❌ Complex      │
+└─────────────────┘    └─────────────────┘    └─────────────────┘
+        │                      │                      │
+        └──────────────────────┴──────────────────────┘
+                              ▼
+              "Which engine owns what?"
+              "How do I connect these?"
+              "Why is this so complicated?"
+```
+
+---
+
+# 4. Future-State Unified Multi-Ledger Costing Engine – Architecture & Design
+
+## 4.1 Conceptual Architecture
+
+### Fundamental Shift: Native D365 Capability, Not Add-On
+
+> **The new Multi-Ledger Costing Engine is built INTO D365 Finance and Supply Chain Management as a native feature.** It merges the best concepts from GIA (multi-ledger valuation, conventions, cost elements) with Cost Accounting (overhead allocation, statistical measures, cost behavior) into a **single, unified costing capability**.
+
+| Current State | Future State |
+|---------------|---------------|
+| GIA = Add-on requiring LCS + Power Platform | Multi-Ledger Costing = Native D365 feature |
+| Cost Accounting = Separate analytical module | Allocation capabilities = Integrated into costing |
+| Three engines (Classic + GIA + Cost Accounting) | One unified engine with multi-ledger support |
+| Shadow subledgers only (GIA) | Full GL posting for any/all cost books |
+| External async processing | Native D365 batch/real-time processing |
+
+### Design Principles
+
+| Principle | Description | Implication |
+|-----------|-------------|-------------|
+| **Native D365 integration** | Built into Finance and SCM, not external add-on | Standard deployment; no LCS add-in; no Power Platform dependency |
+| **Merge GIA + Cost Accounting** | Single unified capability replacing two modules | One place to configure; one mental model |
+| **Multi-book GL posting** | Any cost book can post to GL (or be shadow) | True multi-ledger accounting, not just shadow views |
+| **Unified posting configuration** | One configuration interpreted per cost book | No triple-configuration burden |
+| **Template-driven adoption** | Pre-built templates for 80% of scenarios | Reduce expertise requirements |
+| **Progressive disclosure** | Simple by default, advanced when needed | Approachable for cost accountants |
+
+### Three-Layer Architecture (Native D365 Implementation)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     LAYER 3: REPORTING                          │
+│                  (Native D365 + Power BI)                       │
+│                                                                  │
+│  • Unified Costing Workspaces in D365 Finance/SCM              │
+│  • Multi-book comparison views (SSRS + embedded analytics)     │
+│  • Power BI integration via Entity Store (no Dataverse req'd)  │
+│  • Variance analysis and health dashboards                      │
+└────────────────────────────────────────────────────────────────┘
+                              ▲
+                              │
+┌─────────────────────────────────────────────────────────────────┐
+│                 LAYER 2: COSTING & ALLOCATION                   │
+│              (Merged from Cost Accounting Module)               │
+│                                                                  │
+│  • Overhead allocation (simplified from Cost Accounting)        │
+│  • Cost distribution and cost behavior classification          │
+│  • Period-end allocations and adjustments                       │
+│  • Statistical measures from WMS, Production, HR                │
+│  • Profitability dimensions (customer, channel, project)       │
+└────────────────────────────────────────────────────────────────┘
+                              ▲
+                              │
+┌─────────────────────────────────────────────────────────────────┐
+│                    LAYER 1: VALUATION                           │
+│          (GIA Concepts Brought Native to D365)                  │
+│                                                                  │
+│  • Multi-book inventory valuation (Cost Books)                 │
+│  • Valuation methods: FIFO, LIFO, Weighted Avg, Standard       │
+│  • Cost element decomposition (from GIA)                        │
+│  • Multi-currency with native D365 currency handling           │
+│  • Subledger journal integration (native posting)              │
+│  • ANY book can post to GL (not just one)                      │
+└─────────────────────────────────────────────────────────────────┘
+                              ▲
+                              │
+┌─────────────────────────────────────────────────────────────────┐
+│                 D365 FINANCE & SCM FOUNDATION                   │
+│                                                                  │
+│  • General Ledger (multi-currency, reporting currencies)       │
+│  • Subledger Journal Framework                                  │
+│  • Inventory Transactions & Settlements                         │
+│  • Financial Dimensions                                          │
+│  • Fiscal Calendars                                              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Why Native Integration Changes Everything
+
+| Aspect | Add-On Approach (Current GIA) | Native Integration (Proposed) |
+|--------|------------------------------|-------------------------------|
+| **Deployment** | LCS add-in + Power Platform setup | Standard D365 feature toggle |
+| **Processing** | Async via external service | Batch jobs in D365 or real-time |
+| **GL Posting** | Shadow only; can't post | Any cost book can post to GL |
+| **Data Storage** | Dataverse tables | Native D365 F&O tables |
+| **Subledger Integration** | Parallel to standard subledger | Uses existing subledger journal framework |
+| **Inventory Close** | Not integrated | Fully integrated with inventory close |
+| **Standard Reporting** | Limited; requires Power BI | Full SSRS + workspace + Power BI |
+| **Upgrade Path** | Separate add-on versioning | Standard D365 update process |
+
+### Layer Responsibilities
+
+#### Layer 1: Valuation (GIA-Based)
+
+| Responsibility | How It Works |
+|----------------|--------------|
+| **Inventory valuation** | GIA Ledgers with enhanced valuation methods (add FIFO, LIFO) |
+| **Multi-ledger views** | Multiple ledgers per LE with different conventions |
+| **Cost element tracking** | Decompose inventory value by component (material, freight, duty) |
+| **Currency handling** | Per-ledger currency with FX rate type |
+| **GL posting** | One designated "primary" ledger posts to GL (new capability) |
+| **Event processing** | Single operational event → N ledger calculations |
+
+#### Layer 2: Costing & Allocation (Simplified Engine)
+
+| Responsibility | How It Works |
+|----------------|--------------|
+| **Overhead allocation** | Pattern-based allocation (warehouse rent → products by volume) |
+| **Landed cost integration** | Pull freight, duties from Landed Cost module; allocate to inventory |
+| **Period-end processing** | Run allocations, capture variances, prepare for close |
+| **Statistical measures** | Import from Warehouse Management, HR, external sources |
+| **Profitability analysis** | Extend cost to customer/channel (optional add-on) |
+
+#### Layer 3: Reporting
+
+| Responsibility | How It Works |
+|----------------|--------------|
+| **Inventory workspaces** | Show inventory value by ledger, product, location |
+| **Variance dashboards** | Standard vs. actual, GAAP vs. IFRS differences |
+| **Profitability reports** | Margin by product, customer, channel (if configured) |
+| **Health checks** | Unmapped cost elements, missing allocations, reconciliation gaps |
+
+### Module Consolidation: What Merges From Each
+
+| Source Module | Concepts Brought Forward | How They Merge |
+|---------------|-------------------------|----------------|
+| **GIA Add-In** | Multi-ledger/book architecture | Becomes native "Cost Books" in D365 tables |
+| **GIA Add-In** | Conventions (policy bundles) | Becomes "Costing Policy Templates" with pre-built options |
+| **GIA Add-In** | Cost element decomposition | Kept; simplified with GL account inheritance |
+| **GIA Add-In** | Cost object levels | Kept; aligned with inventory dimensions |
+| **Cost Accounting** | Overhead calculation steps | Simplified to pattern-based allocation |
+| **Cost Accounting** | Statistical dimensions | Integrated; auto-populated from source modules |
+| **Cost Accounting** | Cost behavior classification | Optional; simplified |
+| **Cost Accounting** | Allocation bases | Pre-built patterns replace formula engine |
+| **Cost Accounting** | Cost Control Workspace | Merged into unified costing workspace |
+| **Classic Costing** | Inventory posting profiles | Extended with per-book overrides |
+
+### What Gets Deprecated vs. Enhanced
+
+| Component | Action | Rationale |
+|-----------|--------|----------|
+| **GIA LCS Add-In** | **Deprecate** | Native capability replaces add-in deployment |
+| **GIA Power Platform integration** | **Deprecate** | No external service dependency needed |
+| **GIA Conventions** | **Transform** → Costing Policy Templates | Same concept, simplified and pre-built |
+| **GIA Cost Element Policy** | **Transform** → Inherit from GL + overrides | Reduce redundant configuration |
+| **Cost Accounting Ledger** | **Deprecate** | Replaced by Cost Books with allocation capability |
+| **Cost Accounting Dimension Hierarchies** | **Deprecate** | Use existing product/financial dimension hierarchies |
+| **Cost Accounting Allocation Policies** | **Simplify** → Pattern-based rules | Keep capability, reduce complexity |
+| **Cost Accounting Overhead Calculation** | **Simplify** → Integrated period-end jobs | Same capability, better integration |
+| **Cost Control Workspace** | **Merge** → Unified Costing Workspace | One workspace for all costing activities |
+| **Secondary Cost Elements** | **Optional** | Available for advanced scenarios; hidden by default |
+
+---
+
+## 4.2 Simplified Configuration Model
+
+### Minimum Lovable Configuration
+
+For a typical distribution company to get started, configure these entities:
+
+```
+CORE CONFIGURATION (Required):
+├── 1. Cost Books (2-4 per LE)
+│   ├── Primary GAAP Book (posts to GL - Current layer)
+│   ├── IFRS Book (posts to GL - Operations layer, or shadow)
+│   ├── Management Book (shadow, optional)
+│   └── Tax Book (posts to GL - Tax layer, optional)
+│
+├── 2. Costing Policy Templates (select from pre-built)
+│   ├── GAAP Standard Template
+│   ├── IFRS Standard Template
+│   └── Management Template
+│
+└── 3. GL Account Mapping (extend existing)
+    └── Inventory Posting Profiles + per-book overrides
+
+OPTIONAL CONFIGURATION (Add as needed):
+├── 4. Overhead Allocation Rules (2-5 patterns)
+│   ├── Warehouse overhead → Products
+│   ├── Freight → PO lines
+│   └── Admin overhead → Revenue-based
+│
+└── 5. Profitability Dimensions (if desired)
+    ├── Customer costing
+    └── Channel costing
+```
+
+### Entity-by-Entity Design
+
+#### 1. Cost Books (Native D365 Entity Replacing GIA Ledgers)
+
+```yaml
+CostBook:
+  # Core Identity (stored in D365 F&O tables)
+  costBookId: "GAAP_PRIMARY"
+  name: "US GAAP Primary"
+  legalEntity: "USMF"
+  
+  # Link to D365 Ledger (inherits currency, calendar, FX settings)
+  ledgerId: "USMF"  # Native D365 Ledger reference
+  
+  # Valuation Configuration
+  valuationMethod: "WeightedAverage"  # FIFO | LIFO | WeightedAverage | Standard
+  costObjectLevel: "ProductSiteWarehouse"  # Aligned with inventory dimensions
+  
+  # GL Integration (KEY DIFFERENCE FROM GIA)
+  postsToGL: true                    # ANY book can post to GL
+  glPostingLayer: "Current"          # Current | Operations | Tax | etc.
+  useReportingCurrency: false        # Option to post in reporting currency
+  
+  # Policy Template
+  policyTemplateId: "GAAP_STANDARD"
+  
+  # Processing Configuration
+  processingMode: "RealTime"         # RealTime | Batch | Hybrid
+  batchGroupId: "CostingBatch"       # For batch processing
+  
+  # Initialization (similar to GIA priming)
+  initializationMode: "FromDate"     # FromDate | FromInventoryClose | Fresh
+  initializationDate: "2025-01-01"
+```
+
+**Key Differences from GIA Ledgers:**
+
+| GIA Ledger | Native Cost Book |
+|------------|------------------|
+| External add-in entity | Native D365 table |
+| Shadow only (no GL) | Full GL posting via posting layers |
+| Async via external service | Real-time or batch within D365 |
+| Dataverse storage | D365 F&O database |
+| Requires Power Platform | No external dependency |
+| One-way processing | Integrated with inventory close |
+
+#### 2. Costing Policy Templates (Pre-Built)
+
+| Template ID | Description | Key Treatments |
+|-------------|-------------|----------------|
+| **GAAP_STANDARD** | US GAAP compliant | Capitalize freight + pre-sale storage; no write-down reversal |
+| **IFRS_STANDARD** | IFRS compliant | Capitalize freight; expense storage; require write-down reversal |
+| **GAAP_LIFO** | US GAAP with LIFO | Same as GAAP_STANDARD but LIFO valuation |
+| **MANAGEMENT** | Full absorption | Capitalize all overhead including admin |
+| **TAX_LOCAL** | Local tax rules | Jurisdiction-specific (customizable) |
+
+**Template contents (example for GAAP_STANDARD):**
+
+| Cost Category | Receipt Treatment | Issue Treatment | Period Treatment |
+|---------------|-------------------|-----------------|------------------|
+| Direct Material | Capitalize | COGS | N/A |
+| Freight Inbound | Capitalize | COGS | N/A |
+| Customs Duty | Capitalize | COGS | N/A |
+| Handling Pre-Sale | Capitalize | COGS | N/A |
+| Warehouse Fixed OH | N/A | N/A | Allocate → Capitalize |
+| Storage Pre-Sale | Capitalize | COGS | N/A |
+| Storage Post-Sale | Expense | N/A | N/A |
+| Admin Overhead | Policy choice | N/A | Allocate → Capitalize or Expense |
+| Idle Capacity | Capitalize | N/A | N/A |
+
+**Override mechanism:** Per-ledger, per-category overrides only—not full rule matrix.
+
+```yaml
+CostingPolicyOverride:
+  ledgerId: "MGMT_BOOK"
+  costCategory: "AdminOverhead"
+  defaultTreatment: "Expense"      # From template
+  overrideTreatment: "Capitalize"  # This ledger's choice
+```
+
+#### 3. GL Account Mapping
+
+**Principle:** Extend existing Inventory Posting Profiles rather than create parallel configuration.
+
+```yaml
+# Existing: Inventory Posting Profile (unchanged)
+InventoryPostingProfile:
+  transactionType: "Receipt"
+  itemGroup: "ALL"
+  inventoryAccount: "140100"
+  receiptAccount: "211000"
+
+# New: Ledger-Specific Override (only where different)
+LedgerAccountOverride:
+  ledgerId: "IFRS_EUR"
+  transactionType: "Receipt"
+  itemGroup: "ALL"
+  inventoryAccount: "140200"  # Different account for IFRS
+  # receiptAccount: inherit from base profile
+```
+
+**Result:** 90% of accounts inherited; only exceptions configured.
+
+#### 4. Overhead Allocation Rules (Pattern-Based)
+
+Instead of Cost Accounting's 15-field configuration, use wizard-driven patterns:
+
+**Pattern A: Warehouse Overhead → Products**
+
+```yaml
+OverheadAllocationRule:
+  ruleId: "WH_OVERHEAD_TO_PRODUCTS"
+  name: "Warehouse Overhead to Products"
+  pattern: "CostCenterToProducts"
+  
+  source:
+    costCenters: ["WAREHOUSE_01", "WAREHOUSE_02"]
+    costCategories: ["WarehouseRent", "WarehouseLabor", "WarehouseUtilities"]
+  
+  allocationBasis: "CubicMetersDays"  # Pre-built options
+  # Options: Quantity, Value, Weight, Volume, CubicMetersDays, PalletsDays
+  
+  target:
+    scope: "ProductsInWarehouse"  # Automatically determined
+  
+  timing: "PeriodEnd"  # When to run
+  
+  applicableLedgers: ["GAAP_PRIMARY", "MGMT_BOOK"]
+  
+  glAccounts:
+    sourceRelief: "540200"   # Overhead Applied
+    targetCapitalize: "140100"  # Inventory
+```
+
+**Pattern B: Freight → PO Lines**
+
+```yaml
+OverheadAllocationRule:
+  ruleId: "FREIGHT_TO_PO_LINES"
+  name: "Freight to Purchase Lines"
+  pattern: "FreightToPurchase"
+  
+  source:
+    integrationSource: "LandedCostModule"  # Pull from Landed Cost
+    costCategories: ["FreightInbound", "Insurance", "CustomsBrokerage"]
+  
+  allocationBasis: "Weight"  # or Value, Quantity
+  
+  target:
+    scope: "POLinesOnShipment"  # Automatically determined
+  
+  timing: "AtReceipt"  # When to run
+```
+
+**Pattern C: Percentage Surcharge**
+
+```yaml
+OverheadAllocationRule:
+  ruleId: "HANDLING_SURCHARGE"
+  name: "Handling Surcharge"
+  pattern: "PercentageSurcharge"
+  
+  percentage: 2.5  # 2.5% of material cost
+  appliesTo: ["DirectMaterial"]
+  resultCategory: "HandlingOverhead"
+  
+  timing: "AtReceipt"
+```
+
+**Configuration effort:** 5-10 minutes per rule using wizard interface.
+
+### Step-by-Step Basic Implementation
+
+#### Step 1: Define Costing Ledgers (Day 1 Morning)
+
+1. Create Primary GAAP Ledger
+   - Link to existing D365 Ledger
+   - Select valuation method (Weighted Average)
+   - Set as primary, posts to GL
+   - Select GAAP_STANDARD template
+
+2. Create IFRS Ledger
+   - Same D365 Ledger link (or different if EUR)
+   - Same valuation method
+   - Shadow only (does not post to GL)
+   - Select IFRS_STANDARD template
+
+3. Create Management Ledger (optional)
+   - Select MANAGEMENT template
+   - Shadow only
+
+#### Step 2: Review GL Account Mapping (Day 1 Afternoon)
+
+1. Review existing Inventory Posting Profiles
+2. Create overrides only where ledgers differ
+   - IFRS may use different accounts
+   - Management may use different variance accounts
+
+#### Step 3: Configure Overhead Rules (Day 2)
+
+1. Warehouse Overhead → Products
+   - Select source cost centers
+   - Choose allocation basis (volume, value)
+   - Designate applicable ledgers
+
+2. Freight Allocation (if not using Landed Cost)
+   - Configure freight → PO line allocation
+   - Or enable Landed Cost integration
+
+3. Admin Overhead (if capitalizing)
+   - Configure admin → products allocation
+   - Set applicable ledgers
+
+#### Step 4: Validate and Test (Day 3)
+
+1. Process test transactions
+2. Review multi-ledger views
+3. Verify GL posting (primary ledger)
+4. Run period-end allocation
+5. Review variance reports
+
+**Total implementation time:** 2-3 days for basic configuration
+
+### What We Explicitly Do NOT Expose Initially
+
+| Hidden/Deferred Capability | Reason | When to Enable |
+|---------------------------|--------|----------------|
+| Formula-based allocation bases | Too technical; covers edge cases | "Advanced mode" toggle |
+| Secondary cost elements | Adds complexity without clear value for distribution | Manufacturing scenario |
+| Custom dimension hierarchies | Use existing product/dimension hierarchies | Large enterprise customization |
+| Reciprocal allocation | Rare for distribution | Manufacturing/service scenarios |
+| Multiple policy overlaps | One template + override is simpler | Advanced cost accounting needs |
+| Custom valuation methods | FIFO, LIFO, Avg, Standard cover 99% | Very specialized requirements |
+| Complex security hierarchies | Use standard D365 security | Large enterprise with many cost controllers |
+
+---
+
+# 5. Multi-Ledger Posting Model & Configuration Simplification
+
+## 5.1 Multi-Ledger Posting Design
+
+### Unified Posting Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    INVENTORY TRANSACTION                         │
+│              (PO Receipt, SO Invoice, Transfer)                 │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              UNIFIED POSTING CONFIGURATION                       │
+│                                                                  │
+│   Transaction Type: Receipt                                      │
+│   ┌─────────────────────────────────────────────────────────┐   │
+│   │ Cost Category    │ Base Treatment │ Accounts (Default)  │   │
+│   ├───────────────────┼────────────────┼─────────────────────┤   │
+│   │ Direct Material   │ Capitalize     │ DR 140100 CR 211000│   │
+│   │ Freight Inbound   │ Capitalize     │ DR 140100 CR 211100│   │
+│   │ Customs Duty      │ Capitalize     │ DR 140100 CR 211200│   │
+│   │ Admin Overhead    │ Policy-driven  │ Per ledger policy  │   │
+│   └─────────────────────────────────────────────────────────┘   │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+           ┌───────────────┼───────────────┬───────────────┐
+           ▼               ▼               ▼               ▼
+┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
+│ PRIMARY GAAP    │ │   IFRS EUR      │ │  MANAGEMENT     │
+│                 │ │                 │ │                 │
+│ Posts to GL ✓   │ │ Shadow only     │ │ Shadow only     │
+│ Uses base accts │ │ Override: Admin │ │ Override: Admin │
+│                 │ │ = Expense       │ │ = Capitalize    │
+└─────────────────┘ └─────────────────┘ └─────────────────┘
+```
+
+### How Valuation Posts to Multiple Books
+
+| Step | Books That Post to GL | Shadow Books |
+|------|----------------------|---------------|
+| 1. Transaction captured | ✅ Processed | ✅ Processed |
+| 2. Apply valuation method | ✅ Per book config | ✅ Per book config |
+| 3. Apply cost element mapping | ✅ Per policy template | ✅ Per policy template |
+| 4. Determine treatment per category | ✅ Per template + overrides | ✅ Per template + overrides |
+| 5. Generate subledger entries | ✅ In book currency | ✅ In book currency |
+| 6. Post to General Ledger | ✅ YES (via posting layer) | ❌ NO (analytical only) |
+
+### Multi-Book GL Posting via Posting Layers
+
+**Unlike GIA's shadow-only limitation**, the native multi-ledger engine allows **multiple books to post to GL simultaneously** using D365's existing posting layers:
+
+```yaml
+CostBook:
+  costBookId: "GAAP_USD"
+  postsToGL: true
+  glPostingLayer: "Current"     # Primary statutory
+  
+CostBook:
+  costBookId: "IFRS_EUR"
+  postsToGL: true
+  glPostingLayer: "Operations"   # IFRS secondary
+
+CostBook:
+  costBookId: "TAX_USD"
+  postsToGL: true
+  glPostingLayer: "Tax"          # Tax basis
+
+CostBook:
+  costBookId: "MGMT_FULL"
+  postsToGL: false               # Management book - shadow only
+```
+
+**Result:** True multi-GAAP GL posting within a single legal entity, not just shadow views.
+
+### How Costing Adjustments/Allocations Post
+
+| Adjustment Type | GL Impact | Shadow Ledger Impact |
+|-----------------|-----------|---------------------|
+| **Overhead allocation (period-end)** | Primary ledger posts DR Inventory CR Overhead Applied | Shadow ledgers record same entries (analytical only) |
+| **Landed cost allocation** | Primary ledger posts integrated entries | Shadow ledgers track allocated amounts |
+| **Variance adjustments** | Primary ledger posts variance entries | Shadow ledgers may have different variance treatment |
+| **Cost revaluation** | Primary ledger posts adjustments | Shadow ledgers revalue per their method |
+
+### Avoiding Triple-Configuration
+
+**Current state (problematic):**
+```
+Inventory Posting Profile → Classic D365 posting
+GIA Conventions → GIA subledger (no GL post)
+Cost Accounting Policies → Cost Accounting ledger (no GL post)
+```
+
+**Future state (unified):**
+```
+Unified Posting Configuration
+├── Base Rules (from Inventory Posting Profiles)
+│   └── Account assignments per transaction type
+│
+├── Ledger-Specific Overrides (minimal)
+│   └── Only where accounts differ by ledger
+│
+└── Policy Templates (treatment decisions)
+    └── Capitalize vs. Expense per cost category
+```
+
+### Posting Configuration Inheritance Model
+
+```yaml
+# Level 1: Base Inventory Posting (existing, shared)
+BaseInventoryPosting:
+  transactionType: "Receipt"
+  accounts:
+    inventory: "140100"
+    receipt: "211000"
+    priceVariance: "580100"
+
+# Level 2: Costing Policy Template (shared across ledgers)
+PolicyTemplate: "GAAP_STANDARD"
+  treatments:
+    directMaterial: "Capitalize"
+    freightInbound: "Capitalize"
+    adminOverhead: "Capitalize"
+
+# Level 3: Ledger-Specific Override (sparse, only exceptions)
+LedgerOverride:
+  ledgerId: "IFRS_EUR"
+  overrides:
+    - costCategory: "AdminOverhead"
+      treatment: "Expense"
+      expenseAccount: "620300"
+```
+
+### Reconciliation Between Ledgers
+
+| Scenario | How Handled |
+|----------|-------------|
+| **GAAP vs. IFRS inventory value differs** | Dashboard shows difference with drill-down to treatment differences |
+| **Currency differences** | Each ledger in own currency; consolidated view in group currency |
+| **Timing differences (priming)** | Track "priming period" separately; exclude from variance analysis |
+| **Period close differences** | Each ledger closes independently; reconciliation report shows gaps |
+
+---
+
+## 5.2 Configuration Simplification Details
+
+### From Current State to Future State
+
+| Configuration Area | Current State | Future State | Reduction |
+|--------------------|---------------|--------------|-----------|
+| **Ledger definition** | GIA Ledger (8 fields) | Costing Ledger (6 fields + inheritance) | Similar |
+| **Valuation policy** | GIA Convention (4 sub-policies) | Policy Template (pre-built) + Override | 80% simpler |
+| **Cost element mapping** | GIA Cost Element Policy (rules) | Inherit from GL + exceptions | 70% simpler |
+| **GL account assignment** | Inventory Posting Profiles + GIA separate | Inventory Posting Profiles + overrides | 60% simpler |
+| **Overhead allocation** | Cost Accounting (15+ fields) | Pattern wizard (5-7 fields) | 75% simpler |
+| **Statistical measures** | Manual Cost Accounting import | Auto-import from source systems | 90% simpler |
+| **Security** | Access List Hierarchy (custom) | Standard D365 security | 80% simpler |
+| **Hierarchies** | Dimension hierarchies (2 types) | Use existing product/dimension hierarchies | 90% simpler |
+
+### Configuration Count Comparison
+
+| Entity Type | Current (All Systems Combined) | Future State | Reduction |
+|-------------|-------------------------------|--------------|-----------|
+| Ledger/Book definitions | 5-10 | 3-5 | 50% |
+| Policy/Convention definitions | 5-15 | 0-3 (templates + overrides) | 80% |
+| Cost element definitions | 50-200 | 0 (inherit from GL) | 100% |
+| Cost object definitions | 100-1000+ | 0 (reference existing) | 100% |
+| Hierarchy definitions | 10-20 | 0 (use existing) | 100% |
+| Allocation rules | 10-50 | 3-10 (patterns) | 75% |
+| Posting rule combinations | 100-500 | 5-20 (overrides) | 95% |
+| **Total configuration rows** | **500-2000+** | **15-50** | **95%+** |
+
+### Progressive Complexity Model
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ LEVEL 1: QUICK START (80% of scenarios)                         │
+│                                                                  │
+│ • Select pre-built policy template (GAAP, IFRS, Management)    │
+│ • Configure 2-4 ledgers using wizard                            │
+│ • Accept default GL account inheritance                         │
+│ • Use 1-2 standard overhead patterns                            │
+│                                                                  │
+│ Time: 1-2 days                                                   │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ LEVEL 2: CUSTOMIZED (15% of scenarios)                          │
+│                                                                  │
+│ • Create custom policy template from standard                   │
+│ • Add ledger-specific account overrides                         │
+│ • Configure additional overhead patterns                         │
+│ • Enable profitability dimensions (customer, channel)           │
+│                                                                  │
+│ Time: 1-2 weeks                                                  │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ LEVEL 3: ADVANCED (5% of scenarios)                             │
+│                                                                  │
+│ • Custom allocation formulas (advanced mode)                    │
+│ • Custom hierarchies for specialized reporting                  │
+│ • Reciprocal allocation (manufacturing/service)                 │
+│ • Custom statistical measure integration                        │
+│                                                                  │
+│ Time: 3-6 weeks                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+# 6. UX & Adoption – How Costing Users Would Actually Work
+
+## 6.1 Main Workspaces
+
+### Workspace 1: Cost Books & Valuation
+
+**Purpose:** Manage cost books and review inventory valuation across books
+
+| Tab | What User Configures | What User Monitors |
+|-----|---------------------|-------------------|
+| **Cost Book Setup** | Create/edit cost books; assign policy templates | Book status, processing health |
+| **Valuation Overview** | (Read-only) | Inventory value by book; period-over-period trends |
+| **Book Comparison** | Select books to compare | GAAP vs. IFRS differences; drill-down to item level |
+| **Cost Elements** | Review cost element breakdown | Inventory value by component (material, freight, overhead) |
+| **GL Posting Status** | View posting layer assignments | Which books post to which layers; posting health |
+
+**Mostly automated / template-driven:**
+- Policy template application
+- GL account inheritance
+- Cost element mapping (from GL categories)
+
+### Workspace 2: Costing Policies & Allocations
+
+**Purpose:** Configure and manage overhead allocation and cost distribution
+
+| Tab | What User Configures | What User Monitors |
+|-----|---------------------|-------------------|
+| **Policy Templates** | Review pre-built templates; create custom if needed | Template assignment to ledgers |
+| **Allocation Rules** | Create/edit overhead patterns using wizard | Allocation rule status; last run date |
+| **Statistical Measures** | Configure source system integration | Measure values; data freshness |
+| **Allocation Results** | (Read-only) | Allocated amounts by rule; target products |
+
+**Mostly automated / template-driven:**
+- Pre-built allocation patterns
+- Statistical measure auto-import from WMS, HR systems
+- Pattern-based rule creation via wizard
+
+### Workspace 3: Period Close & Reconciliations
+
+**Purpose:** Execute period-end processing and ensure books are reconciled
+
+| Tab | What User Configures | What User Monitors |
+|-----|---------------------|-------------------|
+| **Period Tasks** | Schedule allocation runs; trigger close processes | Task status; completion checklist |
+| **Reconciliation** | (Mostly automated) | Subledger to GL reconciliation by ledger |
+| **Variance Analysis** | Configure variance thresholds | Standard vs. actual; purchase price variance |
+| **Close Status** | Mark periods as closed | Open periods; pending transactions |
+
+**Mostly automated / template-driven:**
+- Standard period-end task sequence
+- Auto-reconciliation with exception highlighting
+- Variance threshold defaults
+
+### Workspace 4: Profitability & Variance Analysis
+
+**Purpose:** Analyze cost and profitability by product, customer, channel
+
+| Tab | What User Configures | What User Monitors |
+|-----|---------------------|-------------------|
+| **Product Profitability** | Select products/categories | Margin by product; cost breakdown |
+| **Customer Profitability** | Enable customer costing (optional) | Margin by customer; cost-to-serve |
+| **Variance Dashboard** | Set alert thresholds | Variances exceeding thresholds; trends |
+| **What-If Analysis** | Create scenarios (advanced) | Impact of cost changes |
+
+**Mostly automated / template-driven:**
+- Pre-built profitability reports
+- Drill-down from summary to detail
+- Alert-based exception monitoring
+
+## 6.2 Wizard-Driven Configuration
+
+### Wizard Example: Create Cost Book
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                CREATE COST BOOK WIZARD                          │
+│                       Step 1 of 4                                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  What accounting standard will this cost book support?          │
+│                                                                  │
+│  ○ US GAAP (recommended for primary book)                       │
+│  ○ IFRS                                                          │
+│  ○ Local GAAP / Tax                                              │
+│  ○ Management / Internal                                         │
+│                                                                  │
+│  [< Back]  [Next >]  [Cancel]                                   │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│                CREATE COST BOOK WIZARD                          │
+│                       Step 2 of 4                                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Link to D365 Ledger: [USMF ▼]                                  │
+│    (This determines currency and fiscal calendar)               │
+│                                                                  │
+│  Valuation Method:                                               │
+│  ○ Weighted Average (recommended)                               │
+│  ○ FIFO                                                          │
+│  ○ LIFO (US GAAP only)                                          │
+│  ○ Standard Cost                                                 │
+│                                                                  │
+│  [< Back]  [Next >]  [Cancel]                                   │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│                CREATE COST BOOK WIZARD                          │
+│                       Step 3 of 4                                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Should this cost book post to the General Ledger?              │
+│                                                                  │
+│  ○ Yes - Post to GL (select posting layer below)                │
+│       Posting Layer: [Current ▼]                                │
+│         (Current / Operations / Tax)                            │
+│                                                                  │
+│  ○ No - This is a shadow book for reporting only                │
+│                                                                  │
+│  💡 Multiple books can post to GL using different posting layers │
+│                                                                  │
+│  [< Back]  [Next >]  [Cancel]                                   │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│                CREATE COST BOOK WIZARD                          │
+│                       Step 4 of 4                                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Review Configuration:                                           │
+│                                                                  │
+│  Cost Book Name: US GAAP Primary                                 │
+│  Standard: US GAAP                                               │
+│  Currency: USD (from USMF ledger)                               │
+│  Calendar: Fiscal (from USMF ledger)                            │
+│  Valuation: Weighted Average                                     │
+│  Posts to GL: Yes (Current layer)                               │
+│  Policy Template: GAAP_STANDARD                                  │
+│                                                                  │
+│  ☑️ Initialize from date (process historical transactions)       │
+│                                                                  │
+│  [< Back]  [Create Cost Book]  [Cancel]                         │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Wizard Example: Create Overhead Allocation Rule
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│          CREATE OVERHEAD ALLOCATION RULE                         │
+│                  Select Pattern                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  What type of overhead do you want to allocate?                 │
+│                                                                  │
+│  [📦] Warehouse Overhead → Products                             │
+│       Allocate warehouse rent, labor, utilities to products    │
+│       stored in the warehouse                                    │
+│                                                                  │
+│  [🚚] Freight → Purchase Lines                                  │
+│       Allocate shipping costs to purchase order lines           │
+│       on the same shipment                                       │
+│                                                                  │
+│  [🏢] Administrative Overhead → Products/Revenue                │
+│       Allocate admin costs based on sales value or units        │
+│                                                                  │
+│  [%] Percentage Surcharge                                        │
+│       Add a percentage markup to base costs                      │
+│                                                                  │
+│  [⚙️] Custom (Advanced)                                          │
+│       Define a custom allocation formula                         │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 6.3 Health Checks & Diagnostics
+
+### Automated Health Checks
+
+| Check | What It Detects | Recommended Action |
+|-------|-----------------|-------------------|
+| **Unmapped Cost Categories** | GL expense accounts not mapped to cost categories | Map accounts or exclude from costing |
+| **Missing Allocation Sources** | Allocation rules pointing to empty cost centers | Check source data; adjust rule scope |
+| **Book Divergence** | Cost books significantly different beyond expected policy differences | Drill down to understand differences |
+| **Processing Lag** | Batch processing backlog > threshold | Check batch jobs; investigate errors |
+| **Reconciliation Gaps** | Subledger doesn't match GL (for posting books) | Identify missing transactions; run reconciliation |
+| **Statistical Measure Stale** | Measures not updated in X days | Check integration; refresh data |
+| **Posting Layer Conflicts** | Multiple books posting to same layer | Review posting layer assignments |
+
+### Diagnostic Dashboard
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              COSTING SYSTEM HEALTH                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ✅ Cost Book Processing: Healthy (current through Jan 19)       │
+│  ✅ GL Reconciliation: All posting books matched                 │
+│  ⚠️ Allocation Rules: 1 rule has no source data                 │
+│     → "Admin Overhead" rule: Cost center CC999 has no expenses │
+│  ✅ Statistical Measures: Current (updated Jan 20)              │
+│  ✅ Period Status: December 2025 closed                         │
+│  ✅ Posting Layer Usage: No conflicts detected                  │
+│                                                                  │
+│  [View Details]  [Run Health Check Now]                         │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## 6.4 Good Defaults Instead of Blank Slates
+
+| Configuration Area | Old Approach (Blank Slate) | New Approach (Good Defaults) |
+|--------------------|---------------------------|------------------------------|
+| **Policy templates** | Build from scratch | Pre-built GAAP, IFRS, Management templates |
+| **Valuation method** | User must choose | Default to Weighted Average (most common) |
+| **Cost object level** | User must configure | Default to Product-Site-Warehouse |
+| **GL account mapping** | Define every account | Inherit from Inventory Posting Profiles |
+| **Posting layer** | N/A (GIA = shadow only) | Default Current layer for primary book |
+| **Allocation patterns** | Configure all fields | Wizard with pre-built patterns |
+| **Statistical measures** | Manual data entry | Auto-import from WMS, HR, Production |
+| **Period tasks** | User defines sequence | Standard checklist with guided workflow |
+| **Reports** | Build from scratch | Pre-built Power BI templates |
+| **Processing mode** | User configures | Default batch for large volume; real-time for low volume |
+
+---
+
+# 7. Key Trade-offs, Risks, and Open Questions
+
+## 7.1 Key Trade-offs
+
+| Trade-off | Choice Made | Rationale | Risk if Wrong |
+|-----------|-------------|-----------|---------------|
+| **Native vs. GIA add-on foundation** | Build natively into D365 | Eliminates add-on friction; enables GL posting; simplifies deployment | Larger engineering effort than extending GIA |
+| **Merge GIA + Cost Accounting** | Single unified capability | One mental model; one configuration surface; clearer value prop | Transition complexity for existing users |
+| **Template-based vs. fully configurable** | Templates + overrides | Faster adoption; covers 80% of scenarios | Advanced users may feel constrained |
+| **Any-book GL posting vs. single primary** | Any book can post (via posting layers) | True multi-GAAP GL; no shadow-only limitation | More complex reconciliation; posting layer training |
+| **Inherit from GL vs. parallel configuration** | Inherit with overrides | Less duplication; easier maintenance | Couples costing to GL structure |
+| **Pre-built statistical measures vs. custom** | Auto-import + limited custom | Reduces configuration burden | May miss specialized use cases |
+| **Standard D365 security vs. custom hierarchy** | Standard D365 | Simpler; leverages existing investment | Less granular cost object access |
+| **Batch vs. real-time processing** | Both (configurable per book) | Flexibility for different volumes | Complexity in processing modes |
+
+## 7.2 Risks and Mitigations
+
+| Risk | Likelihood | Impact | Mitigation |
+|------|------------|--------|------------|
+| **Engineering effort larger than expected** | Medium | High | Phase delivery; start with valuation layer (Layer 1) |
+| **Existing GIA customers reluctant to migrate** | Medium | Medium | Provide migration tools; parallel-run capability; clear value messaging |
+| **Posting layers not well understood** | Medium | Medium | Training; good defaults; limit to common layer patterns |
+| **Customers want full Cost Accounting** | Medium | Medium | Offer "advanced mode" that exposes more capability |
+| **Template library insufficient** | Medium | Medium | Plan for template customization and community templates |
+| **Statistical measure auto-import too limited** | Medium | Low | Provide fallback manual import option |
+| **Performance at scale** | Medium | High | Prototype with large transaction volumes early |
+| **Migration from current GIA/Cost Accounting** | Medium | Medium | Provide migration tools and parallel-run capability |
+| **Dependency on D365 platform changes** | Low | High | Align with D365 platform roadmap; use stable APIs |
+
+## 7.3 Open Questions
+
+### Product Direction Questions
+
+| Question | Options | Recommendation |
+|----------|---------|----------------|
+| **What happens to GIA add-in?** | Deprecate / Maintain for legacy / Migrate customers | Deprecate after migration path established |
+| **What happens to Cost Accounting module?** | Deprecate / Maintain / Freeze | Freeze for legacy; no new investment; migrate to unified engine |
+| **How to handle existing GIA customers?** | Migration tools / Parallel run / Side-by-side | Migration tools + parallel run capability |
+| **Feature toggle or always-on?** | Feature flag / Default on | Feature flag initially; default on after stabilization |
+
+### Architecture Questions
+
+| Question | Options | Recommendation |
+|----------|---------|----------------|
+| **Where do cost book entries persist?** | Existing inventory tables / New tables / Both | Extend existing tables with book ID |
+| **How are allocations versioned?** | Per period / Per run / Both | Per run with period aggregation |
+| **How is currency translation handled for allocations?** | Source rate / Target rate / Policy | Policy-based per book |
+| **What's the relationship to Rebate Management, Landed Cost?** | Integrate / Parallel / Replace | Integrate for unified cost view |
+| **How does this relate to D365 dual currency / reporting currency?** | Align / Extend / Replace | Extend to support multiple reporting views |
+
+### Implementation Questions
+
+| Question | Options | Recommendation |
+|----------|---------|----------------|
+| **Phase 1 scope?** | MVP (valuation only) / MVP + basic allocation | MVP + basic allocation (key differentiator) |
+| **Pilot customer profile?** | Distribution only / Broader | Distribution first; manufacturing later |
+| **Deployment model?** | Standard D365 update / Separate module | Standard D365 update with feature flag |
+| **Backward compatibility?** | Full / Limited / None | Limited; provide migration tools |
+
+---
+
+## Summary
+
+This design proposes a **pragmatic, adoption-focused costing engine built natively into D365 Finance and Supply Chain Management** that:
+
+1. **Merges GIA and Cost Accounting into a single unified capability** — one module, one configuration surface, one mental model. No more confusion about which engine does what.
+
+2. **Brings multi-ledger valuation natively into D365** — the best concepts from GIA (cost books, conventions, cost elements) become standard D365 features, not an external add-in requiring Power Platform.
+
+3. **Enables any cost book to post to GL** via D365's posting layers — true multi-GAAP GL posting (US GAAP, IFRS, Tax) within a single legal entity, not just shadow views.
+
+4. **Simplifies allocation and overhead** — cherry-picks the best from Cost Accounting (overhead allocation, statistical measures) but replaces complex configuration with pattern-based wizards and templates.
+
+5. **Uses native D365 infrastructure** — subledger journal framework, batch processing, inventory close integration, standard security. No external services, no Dataverse dependency.
+
+6. **Prioritizes adoption** through pre-built templates, progressive disclosure, good defaults, and health diagnostics.
+
+7. **Targets distribution companies first** with a design that's generalizable to manufacturing and other scenarios.
+
+### The Fundamental Change
+
+| Current State | Future State |
+|---------------|---------------|
+| GIA = Add-on with Power Platform dependency | Multi-Ledger Costing = Native D365 capability |
+| Cost Accounting = Separate complex module | Allocation = Integrated into costing |
+| Shadow views only (GIA) | Any book posts to GL |
+| Triple configuration (Inventory Posting + GIA + Cost Accounting) | Single unified configuration |
+| Specialist expertise required | Template-driven, approachable |
+
+The result should be a costing solution that a typical cost accountant in a distribution company can configure in **days rather than weeks**, while providing the multi-ledger, multi-standard, GL-posting capabilities that global organizations require.
+
+---
+
+*Document Version: 2.0*  
+*Date: January 20, 2026*  
+*Status: Design Proposal for Review — Native D365 Integration Approach*
